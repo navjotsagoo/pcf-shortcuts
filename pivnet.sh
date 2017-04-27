@@ -1,0 +1,151 @@
+#!/bin/bash
+
+PIVNETRC=~/.pivnetrc
+
+if [ -f "$PIVNETRC" ]; then
+  chmod 400 $PIVNETRC
+  source $PIVNETRC 2>/dev/null
+fi
+
+set -e
+
+usage_and_exit() {
+  cat <<EOF
+Usage: pivnet <command> [options] [options]
+
+Examples:
+  pivnet token SAMPLEaJimQVTq2zWBYZ
+  pivnet download https://network.pivotal.io/.../product_files/7509/download
+  (optional, manually define filename) pivnet download https://network.pivotal.io/.../product_files/7509/download optional_save_filename
+EOF
+  exit 1
+}
+
+error_and_exit() {
+  echo "$1" && exit 1
+}
+
+jq_exists() {
+  command -v jq >/dev/null 2>&1
+}
+
+set_token() {
+  [ -f "$PIVNETRC" ] && chmod 600 $PIVNETRC
+  echo "PIVNET_API_TOKEN=$1" > $HOME/.pivnetrc
+  chmod 400 $PIVNETRC
+  echo "Updated Pivotal Network API Token"
+}
+
+validate_checksum() {
+  local FILENAME=$1
+  local CHECKSUM=$2
+
+  # Ubuntu uses md5sum; OS X uses md5
+  local MD5SUM=$(command -v md5sum 2>/dev/null || command -v md5 2>/dev/null)
+  local OUTPUT=$($MD5SUM $FILENAME)
+
+  [[ "$OUTPUT" =~ "$CHECKSUM" ]]
+}
+
+download_from_pivnet() {
+  local PIVNET_API_TOKEN=$PIVNET_API_TOKEN
+  if [ -z "$PIVNET_API_TOKEN" ]; then
+    read -r -p "Pivnet API Token: " PIVNET_API_TOKEN
+
+    local SAVE_TOKEN=
+    read -r -p "Save token for future use? [Y/n]: " SAVE_TOKEN
+
+    SAVE_TOKEN=$(echo "${SAVE_TOKEN:-y}" | awk '{print tolower($0)}')
+
+    if [ "$SAVE_TOKEN" = "y" ]; then
+      set_token $PIVNET_API_TOKEN
+    fi
+  fi
+
+  local DOWNLOAD_URL=$1
+  if [ -z "$DOWNLOAD_URL" ]; then
+    read -r -p "Remote file URL: " DOWNLOAD_URL
+  fi
+
+  # Hit the download URL but don't follow the redirect just yet so we can validate
+  # the response codes and get the filename from the Location header
+  local OUTPUT=$(curl -s --data '' -D- -o /dev/null -H "Authorization: Token $PIVNET_API_TOKEN" $DOWNLOAD_URL)
+
+  if echo "$OUTPUT" | grep -q 'HTTP/1.1 401'; then
+    error_and_exit "User could not be authenticated. Invalid token: $PIVNET_API_TOKEN"
+  elif echo "$OUTPUT" | grep -q 'HTTP/1.1 403'; then
+    error_and_exit "User does not have access to download files from this release."
+  elif echo "$OUTPUT" | grep -q 'HTTP/1.1 404'; then
+    error_and_exit "The product or release cannot be found. Invalid Download URL: $DOWNLOAD_URL"
+  elif echo "$OUTPUT" | grep -q 'HTTP/1.1 451'; then
+
+    echo "User has not accepted the current EULA for this release."
+    local ACCEPT_EULA=
+    read -r -p "Accept End User License Agreement? [Y/n]: " ACCEPT_EULA
+    ACCEPT_EULA=$(echo "${ACCEPT_EULA:-y}" | awk '{print tolower($0)}')
+
+    if [ "$ACCEPT_EULA" != "y" ]; then
+      error_and_exit "You must agree to the End User License Agreement terms and conditions in order to download software."
+    fi
+
+    local BASE_URL=${DOWNLOAD_URL%/product_files*}
+
+    local ACCEPT_EULA_RESPONSE_CODE=$(curl -s -w "%{http_code}" -o /dev/null --data '' -H "Authorization: Token $PIVNET_API_TOKEN" $BASE_URL/eula_acceptance)
+
+    if [ "$ACCEPT_EULA_RESPONSE_CODE" != "200" ]; then
+      error_and_exit "Failed to accept End User License Agreement. Please visit the product page on network.pivotal.io and accept the EULA."
+    fi
+
+    echo "Accepted End User License Agreement. Visit https://network.pivotal.io/users/dashboard/eulas to view all accepted EULAs"
+
+    # Hit the download url again now that we've accepted the EULA
+    OUTPUT=$(curl -s --data '' -D- -o /dev/null -H "Authorization: Token $PIVNET_API_TOKEN" $DOWNLOAD_URL)
+  fi
+
+  # Get the filename from the redirect and strip the newline char
+  if [ $ARG2 == 1 ]; then
+    local FILENAME=$(echo "$OUTPUT" | grep -o -E 'filename=.*$' | sed -e 's/filename=//' | sed "s/$(printf '\r')//")
+  else
+    local FILENAME=$ARG2
+  fi
+
+  if [ -z "$FILENAME" ]; then
+    error_and_exit "Unable to get the filename from the download url."
+  fi
+
+  echo "Downloading $FILENAME from $DOWNLOAD_URL"
+
+  curl -o $FILENAME \
+    -L --data '' \
+    -H "Authorization: Token $PIVNET_API_TOKEN" \
+    $DOWNLOAD_URL
+
+  echo "Validating checksum"
+  local PRODUCT_FILE_URL=${DOWNLOAD_URL%/download}
+
+  local CHECKSUM=
+  if jq_exists; then
+    CHECKSUM=$(curl -s $PRODUCT_FILE_URL | jq -r .product_file.md5)
+  else
+    CHECKSUM=$(curl -s $PRODUCT_FILE_URL | grep -o -E '"md5"\s{0,}:\s{0,}"[0-9a-zA-Z]+"' | cut -d : -f 2 | tr -d \" | tr -d ' ')
+  fi
+
+  if ! validate_checksum $FILENAME $CHECKSUM; then
+    error_and_exit "Checksum is invalid! Please re-download the product."
+  else
+    echo "Checksum is valid."
+  fi
+}
+
+CMD=$1 ARG=$2 ARG2=${3:-1}
+
+if [ "token" = "$CMD" ]; then
+  set_token $ARG
+elif [ "download" = "$CMD" ]; then
+  echo $ARG
+  echo $ARG2
+  download_from_pivnet $ARG
+  echo $ARG
+else
+  usage_and_exit
+fi
